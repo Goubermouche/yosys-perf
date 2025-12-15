@@ -57,6 +57,7 @@ def run(mode, design, synth_mode, yosys, params):
             script = read_rtlil_ys + "\n" + synth_ys
         case _:
             assert False, "out of sync RunMode with run"
+    print(f"{yosys}: {artifact_file} {synth_mode.name}")
     log = r([yosys, "-p", script])
     print(yosys_log_eol.search(log).group(0))
 
@@ -69,7 +70,7 @@ def design_map():
                 d[c.__name__.lower()] = c
     return d
 
-def params(pairs):
+def params_from_str(pairs):
     ret = dict()
     for pair in pairs:
         key_value = pair.split("=")
@@ -80,18 +81,31 @@ def params(pairs):
         ret[lhs] = rhs
     return ret
 
+def single_run(mode, args, design, params):
+    if mode != RunMode.SYNTH and args.flow != "":
+        print("--flow specified outside of synth mode")
+        exit(1)
+
+    for yosys in args.yosys:
+        print(design)
+        run(mode,
+            (design, design_map()[design]()),
+            SynthMode.from_str(args.flow),
+            yosys,
+            params_from_str(params)
+        )
+
 def main():
-    designs = design_map()
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=[mode.value for mode in RunMode])
     parser.add_argument("--yosys",
-                        default=Path("yosys"),
+                        default=[Path("yosys")],
                         type=Path,
+                        nargs="+",
                         help="Path to the Yosys binary")
     parser.add_argument("--design",
-                        required=True,
                         type=str,
-                        choices=designs.keys(),
+                        choices=design_map().keys(),
                         help="Path to the Yosys binary")
     parser.add_argument("--flow",
                         default="",
@@ -100,6 +114,9 @@ def main():
     parser.add_argument("--param",
                         nargs='*',
                         default=[],
+                        help="Design parameters")
+    parser.add_argument("--auto",
+                        action="store_true",
                         help="Design parameters")
 
     args = parser.parse_args()
@@ -112,11 +129,19 @@ def main():
             except subprocess.CalledProcessError:
                 arg = "--version"
             subprocess.run([args.yosys, arg], stdout=myoutput)
-    design = (args.design, designs[args.design]())
-    if mode != RunMode.SYNTH and args.flow != "":
-        print("--flow specified outside of synth mode")
-        exit(1)
-    run(mode, design, SynthMode.from_str(args.flow), args.yosys, params(args.param))
+
+    if args.auto:
+        for design, params in [
+            ("jpeg", []),
+            ("ibex", []),
+            ("fft64", ["width=64"]),]:
+            single_run(mode, args, design, params)
+    else:
+        if not args.design:
+            print("Missing --design without --auto")
+            exit(1)
+        single_run(mode, args, args.design, args.param)
+
 
 
 if __name__ == "__main__":
