@@ -17,13 +17,21 @@ class RunMode(StrEnum):
 class SynthMode(StrEnum):
     SYNTH = "synth"
     SYNTH_FLATTEN = "synth -flatten"
+    def from_str(s):
+        if s == "":
+            return SynthMode.SYNTH
+        elif s == "flatten":
+            return SynthMode.SYNTH_FLATTEN
+        else:
+            print(f"Invalid synthesis flow: {s}")
+            exit(1)
     # Note: hard-coded
     # SYNTH_SKY130 = "synth; -lib canon/OpenROAD-flow-scripts/flow/platforms/sky130hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
 
 def fmt_params(params):
     s = ""
     first = True
-    for key, value in params:
+    for key, value in params.items():
         s += f"{key}_{value}"
         if not first:
             s += "__"
@@ -61,6 +69,17 @@ def design_map():
                 d[c.__name__.lower()] = c
     return d
 
+def params(pairs):
+    ret = dict()
+    for pair in pairs:
+        key_value = pair.split("=")
+        if (len(key_value)) != 2:
+            print(f"Can't parse {pair} as parameter")
+            exit(1)
+        lhs, rhs = key_value
+        ret[lhs] = rhs
+    return ret
+
 def main():
     designs = design_map()
     parser = argparse.ArgumentParser()
@@ -74,6 +93,13 @@ def main():
                         type=str,
                         choices=designs.keys(),
                         help="Path to the Yosys binary")
+    parser.add_argument("--flow",
+                        default="",
+                        type=str,
+                        help="Alternate flow, valid only if mode is synth")
+    parser.add_argument("--param",
+                        nargs='*',
+                        help="Design parameters")
 
     args = parser.parse_args()
     mode = RunMode(args.mode)
@@ -86,8 +112,10 @@ def main():
                 arg = "--version"
             subprocess.run([args.yosys, arg], stdout=myoutput)
     design = (args.design, designs[args.design]())
-    # TODO SynthMode from args
-    run(mode, design, SynthMode.SYNTH, args.yosys, dict())
+    if mode != RunMode.SYNTH and args.flow != "":
+        print("--flow specified outside of synth mode")
+        exit(1)
+    run(mode, design, SynthMode.from_str(args.flow), args.yosys, params(args.param))
 
 
 if __name__ == "__main__":
