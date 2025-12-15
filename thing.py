@@ -31,7 +31,7 @@ class SynthMode(StrEnum):
 def fmt_params(params):
     s = ""
     first = True
-    for key, value in params.items():
+    for key, value in sorted(params.items()):
         s += f"{key}_{value}"
         if not first:
             s += "__"
