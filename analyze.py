@@ -1,10 +1,5 @@
-#!/usr/bin/env python3
-"""
-Analyze and profile Yosys designs.
-Combines profiling (like thing.py) with design statistics.
-"""
-
 from pathlib import Path
+from collections import defaultdict
 import argparse
 import subprocess
 import re
@@ -19,25 +14,101 @@ except ImportError:
 	HAS_SCRIPTS = False
 
 
-def run_yosys(yosys_bin, script):
+def run_yosys(yosys_bin, script, timing=False):
+	cmd = [yosys_bin]
+	if timing:
+		cmd.append("-t")
+	cmd.extend(["-p", script])
 	result = subprocess.run(
-		[yosys_bin, "-p", script],
+		cmd,
 		capture_output=True,
 		text=True
 	)
 	return result.stdout + result.stderr
 
 
+def parse_pass_timing(output):
+	"""
+	Parse Yosys -t output to extract per-pass timing.
+	Returns list of (pass_name, seconds, count) sorted by time descending.
+	"""
+	timestamps = []
+	
+	for line in output.split('\n'):
+		m = re.match(r'\[(\d+\.\d+)\]\s*(.*)', line)
+		if m:
+			ts = float(m.group(1))
+			content = m.group(2).strip()
+			timestamps.append((ts, content))
+	
+	if len(timestamps) < 2:
+		return []
+	
+	pass_times = defaultdict(float)
+	pass_counts = defaultdict(int)
+	
+	current_pass = None
+	pass_start = None
+	
+	for ts, content in timestamps:
+		# "Executing PASSNAME pass" or "passname"
+		started_pass = None
+		
+		# "Executing PASSNAME pass"
+		m = re.search(r'Executing\s+(\S+)\s+pass', content)
+		if m:
+			started_pass = m.group(1).lower()
+		
+		if started_pass:
+			if current_pass and pass_start is not None:
+				delta = ts - pass_start
+				if delta > 0.0001:
+					pass_times[current_pass] += delta
+					pass_counts[current_pass] += 1
+			current_pass = started_pass
+			pass_start = ts
+	
+	if current_pass and pass_start is not None and timestamps:
+		delta = timestamps[-1][0] - pass_start
+		if delta > 0.0001:
+			pass_times[current_pass] += delta
+			pass_counts[current_pass] += 1
+	
+	result = []
+	for name in pass_times:
+		result.append((name, pass_times[name], pass_counts[name]))
+	return sorted(result, key=lambda x: -x[1])
+
+
+def format_pass_timing(pass_times, top_n=10):
+	"""Format pass timing for display. top_n=None shows all."""
+	if not pass_times:
+		return ""
+	total = sum(t for _, t, _ in pass_times)
+	lines = []
+	
+	show_passes = pass_times if top_n is None else pass_times[:top_n]
+	for name, secs, count in show_passes:
+		pct = (secs / total * 100) if total > 0 else 0
+		count_str = f"({count}x)" if count > 1 else ""
+		lines.append(f"    {pct:5.1f}%  {secs:6.3f}s  {name} {count_str}")
+	
+	if top_n is not None and len(pass_times) > top_n:
+		shown = sum(t for _, t, _ in pass_times[:top_n])
+		other_pct = ((total - shown) / total * 100) if total > 0 else 0
+		lines.append(f"    {other_pct:5.1f}%  ... {len(pass_times) - top_n} more passes")
+	
+	return '\n'.join(lines)
+
+
 def parse_output(output):
 	stats = {}
 	
-	# Try to find totals section (with submodules)
 	match = re.search(
 		r'\+----------Count including submodules\.\s*\|\s*(.*?)(?:End of script|$)',
 		output, re.DOTALL
 	)
 	
-	# If not found, try the simpler format for flattened designs
 	if not match:
 		match = re.search(
 			r'Printing statistics\.\s*(.*?)(?:End of script|$)',
@@ -85,7 +156,7 @@ def parse_output(output):
 		stats["time"] = stats["user_time"] + stats["sys_time"]
 		stats["mem_mb"] = float(m.group(3))
 	
-	# Parse top time consumers from
+	# Parse top time consumers
 	m = re.search(r'Time spent:\s*(.+?)(?:\n|$)', output)
 	if m:
 		top_times = []
@@ -164,7 +235,7 @@ def common_parent(paths):
 	return Path(*common_parts) if common_parts else Path(".")
 
 
-def analyze(yosys_bin, design, params, mode, flow):
+def analyze(yosys_bin, design, params, mode, flow, timing=False):
 	"""Analyze a single design with given yosys binary."""
 	designs = design_map()
 	
@@ -188,22 +259,26 @@ def analyze(yosys_bin, design, params, mode, flow):
 		read_sv = design_class.sv(params)
 		synth_cmd = "synth -flatten" if flow == "flatten" else "synth"
 		script = f"{read_sv}; {synth_cmd}; stat"
-	else:  # synth mode
+	else:
 		if not artifact_path.exists():
 			print(f"Artifact not found: {artifact_path}", file=sys.stderr)
 			return None
 		synth_cmd = "synth -flatten -noabc" if flow == "flatten" else "synth -noabc"
 		script = f"read_rtlil {artifact_path}; {synth_cmd}; abc -g AND,NAND,OR,NOR,XOR,XNOR,ANDNOT,ORNOT,MUX -script +print_stats; stat"
 	
-	output = run_yosys(yosys_bin, script)
+	output = run_yosys(yosys_bin, script, timing=timing)
 	stats = parse_output(output)
 	stats["design"] = tag
 	stats["yosys"] = str(yosys_bin)
 	
+	if timing:
+		pass_times = parse_pass_timing(output)
+		stats["pass_timing"] = pass_times
+	
 	return stats
 
 
-def print_human(all_stats, yosys_bins):
+def print_human(all_stats, yosys_bins, verbose=False):
 	"""Print human-readable output."""
 	# Group by design
 	by_design = {}
@@ -220,7 +295,6 @@ def print_human(all_stats, yosys_bins):
 			sys_t = s.get('sys_time')
 			mem = s.get('mem_mb')
 			
-			# Header with yosys binary if multiple
 			if len(yosys_bins) > 1:
 				if user is not None:
 					print(f"{yosys}: {design}: user {user:.2f}s system {sys_t:.2f}s, MEM: {mem:.2f} MB")
@@ -232,46 +306,21 @@ def print_human(all_stats, yosys_bins):
 				else:
 					print(f"{design}:")
 			
-			# Design stats
-			wires = s.get('wires', 0)
-			if wires:
-				print(f"  {wires} wires, {s.get('wire_bits', 0)} wire bits")
-				print(f"  {s.get('public_wires', 0)} public wires, {s.get('public_wire_bits', 0)} public wire bits")
-			
-			ports = s.get('ports', 0)
-			if ports:
-				print(f"  {ports} ports, {s.get('port_bits', 0)} port bits")
-			
-			mem_count = s.get('memories')
-			if mem_count:
-				print(f"  {mem_count} memories, {s.get('memory_bits', 0)} memory bits")
-			
-			proc = s.get('processes')
-			if proc:
-				print(f"  {proc} processes")
-			
-			# Cells with FF/logic split
-			cells = s.get('cells', 0)
-			ff = s.get('ff_count', 0)
-			logic = s.get('logic_count', 0)
-			if cells:
-				print(f"  {cells} cells ({logic} logic, {ff} FF)")
-				
-				breakdown = s.get("cells_breakdown", {})
-				for cell, count in sorted(breakdown.items(), key=lambda x: -x[1]):
-					print(f"    {count} {cell}")
-			
-			# ABC stats
 			abc_nd = s.get('abc_nd')
 			abc_lev = s.get('abc_lev')
 			if abc_nd:
 				print(f"  ABC: {abc_nd} nodes, {abc_lev} levels")
 			
-			# Top time consumers
-			top_times = s.get('top_times', [])
-			if top_times:
-				parts = [f"{pct}% {name} ({count}x)" for name, pct, count, secs in top_times]
-				print(f"  Top time: {', '.join(parts)}")
+			pass_timing = s.get('pass_timing', [])
+			if pass_timing:
+				print(f"  Pass timing:")
+				top_n = None if verbose else 10
+				print(format_pass_timing(pass_timing, top_n=top_n))
+			else:
+				top_times = s.get('top_times', [])
+				if top_times:
+					parts = [f"{pct}% {name} ({count}x)" for name, pct, count, secs in top_times]
+					print(f"  Top time: {', '.join(parts)}")
 			
 			print()
 
@@ -351,6 +400,10 @@ def main():
 		help="Synthesis flow variant")
 	parser.add_argument("--csv", action="store_true",
 		help="CSV output (for comparing multiple yosys binaries)")
+	parser.add_argument("-t", "--timing", action="store_true",
+		help="Detailed per-pass timing (runs yosys with -t flag)")
+	parser.add_argument("-v", "--verbose", action="store_true",
+		help="Show all passes (not just top 10)")
 	
 	args = parser.parse_args()
 	
@@ -370,7 +423,7 @@ def main():
 	for yosys_bin in args.yosys:
 		for design, design_params in designs_to_run:
 			merged_params = {**design_params, **params}
-			stats = analyze(yosys_bin, design, merged_params, args.mode, args.flow)
+			stats = analyze(yosys_bin, design, merged_params, args.mode, args.flow, timing=args.timing)
 			if stats:
 				all_stats.append(stats)
 	
@@ -381,9 +434,8 @@ def main():
 	if args.csv:
 		print_csv(all_stats, args.yosys)
 	else:
-		print_human(all_stats, args.yosys)
+		print_human(all_stats, args.yosys, verbose=args.verbose)
 
 
 if __name__ == "__main__":
 	main()
-
