@@ -5,9 +5,8 @@ import tempfile, json, re, sys, os
 
 try:
     import scripts
-    HAS_SCRIPTS = True
 except ImportError:
-    HAS_SCRIPTS = False
+    scripts = None
 
 r = functools.partial(subprocess.check_output, text=True)
 
@@ -64,7 +63,7 @@ def artifact_path(tag):
 
 
 def design_map():
-    if not HAS_SCRIPTS: return {}
+    if scripts is None: return {}
     d = {}
     for _, modname, ispkg in pkgutil.iter_modules(scripts.__path__):
         if ispkg: continue
@@ -75,8 +74,7 @@ def design_map():
 
 
 def discover_designs():
-    p = Path("artifacts")
-    return sorted(f.stem for f in p.glob("*.il")) if p.exists() else []
+    return sorted(f.stem for f in Path("artifacts").glob("*.il"))
 
 
 def params_from_str(pairs):
@@ -130,6 +128,16 @@ def run_yosys(yosys_bin, script, detailed_timing=False):
     return result.stdout + result.stderr
 
 
+def synth_and_abc(yosys_bin, tag, flow="flatten", detailed_timing=False):
+    """common path for analyze and ff: read artifact, synth -noabc, abc, stat"""
+    ap = artifact_path(tag)
+    assert ap.exists(), f"artifact not found: {ap}"
+    synth_cmd = "synth -flatten -noabc" if flow == "flatten" else "synth -noabc"
+    return run_yosys(yosys_bin,
+        f"read_rtlil {ap}; {synth_cmd}; stat; abc -g {ABC_GATES} -script +print_stats",
+        detailed_timing=detailed_timing)
+
+
 _STAT_FIELDS = [
     "wires", "wire bits", "public wires", "public wire bits",
     "ports", "port bits", "memories", "memory bits", "processes",
@@ -137,7 +145,7 @@ _STAT_FIELDS = [
 
 
 def parse_stat(output):
-    """parse yosys `stat` — handles both "N cells" (new) and "Number of cells: N" (old)"""
+    """parse yosys `stat`"""
     stats = {}
 
     # new format
@@ -319,12 +327,7 @@ def run_mode_basic(out, mode, design, synth_mode, yosys, params):
 
 
 def run_mode_analyze(yosys_bin, tag, flow, detailed_timing=False):
-    ap = artifact_path(tag)
-    assert ap.exists(), f"artifact not found: {ap}"
-    synth_cmd = "synth -flatten -noabc" if flow == "flatten" else "synth -noabc"
-    output = run_yosys(yosys_bin,
-        f"read_rtlil {ap}; {synth_cmd}; abc -g {ABC_GATES} -script +print_stats; stat",
-        detailed_timing=detailed_timing)
+    output = synth_and_abc(yosys_bin, tag, flow=flow, detailed_timing=detailed_timing)
     stats = parse_stat(output)
     stats["design"] = tag
     stats["yosys"] = str(yosys_bin)
@@ -333,10 +336,7 @@ def run_mode_analyze(yosys_bin, tag, flow, detailed_timing=False):
 
 
 def run_mode_ff(yosys_bin, tag, cell_cats, ff_size=6):
-    ap = artifact_path(tag)
-    assert ap.exists(), f"artifact not found: {ap}"
-    output = run_yosys(yosys_bin,
-        f"read_rtlil {ap}; synth -flatten -noabc; stat; abc -g {ABC_GATES} -script +print_stats")
+    output = synth_and_abc(yosys_bin, tag, flow="flatten")
     breakdown = parse_stat(output).get("cells_breakdown", {})
     totals, by_type = classify_cells(breakdown, cell_cats)
     total_cells = sum(totals.values())
@@ -366,12 +366,43 @@ def resolve_designs(args, mode):
     return [(d, {}) for d in found]
 
 
-def single_run(out, mode, args, design_name, params):
+def run_basic_modes(out, mode, args, design_list):
+    if mode == RunMode.ARTIFACT:
+        with open(Path("canon") / "ys-version", 'w') as f:
+            subprocess.run([str(args.yosys[0]), "--version"], stdout=f)
+
     designs = design_map()
-    assert design_name in designs, f"unknown design: {design_name}"
-    assert mode == RunMode.SYNTH or args.flow == "", "--flow only valid for synth mode"
-    for yosys in args.yosys:
-        run_mode_basic(out, mode, (design_name, designs[design_name]()), SynthMode.from_str(args.flow), yosys, params)
+    for design_name, params in design_list:
+        assert design_name in designs, f"unknown design: {design_name}"
+        assert mode == RunMode.SYNTH or args.flow == "", "--flow only valid for synth mode"
+        for yosys in args.yosys:
+            run_mode_basic(out, mode, (design_name, designs[design_name]()),
+                           SynthMode.from_str(args.flow), yosys, params)
+    out.out()
+
+
+def run_analyze(out, args, design_list):
+    stats = [run_mode_analyze(ys, tag_for(d, p), args.flow, detailed_timing=args.detailed_timing)
+             for ys in args.yosys for d, p in design_list]
+    stats = [s for s in stats if s]
+    assert stats, "no results"
+    for s in stats: out.add_stats(s, args.yosys)
+    out.out()
+
+
+def run_ff(out, args, design_list):
+    cell_cats = dump_cell_groups(args.yosys[0])
+    results = [run_mode_ff(args.yosys[0], tag_for(d, p), cell_cats=cell_cats, ff_size=args.ff_size)
+               for d, p in design_list]
+    assert results, "no results"
+    if OutputMode(args.output) == OutputMode.CSV:
+        print("design;seq;comb;other;total;ff_ratio;abc_area;ff_area;total_area;ff_area_pct")
+        for res in results:
+            print(f"{res['design']};{res['seq']};{res['comb']};{res['other']};{res['total']};"
+                  f"{res['ratio']:.4f};{res['abc_area']};{res['ff_area']};{res['total_area']};{res['ff_area_pct']:.2f}")
+    else:
+        print(f"(ff_size={args.ff_size})")
+        for res in results: out.add_ff(res)
 
 
 def main():
@@ -390,42 +421,17 @@ def main():
 
     mode = RunMode(args.mode)
     out = CsvOut() if OutputMode(args.output) == OutputMode.CSV else HumanOut(verbose=args.verbose)
+    design_list = resolve_designs(args, mode)
 
-    if mode in (RunMode.ARTIFACT, RunMode.VERILOG, RunMode.SYNTH):
-        if mode == RunMode.ARTIFACT:
-            Path("canon").mkdir(parents=True, exist_ok=True)
-            with open(Path("canon") / "ys-version", 'w') as f:
-                try: r([str(args.yosys[0]), "--git-hash"], stderr=subprocess.STDOUT)
-                except subprocess.CalledProcessError: pass
-                subprocess.run([str(args.yosys[0]), "--version"], stdout=f)
-        for name, params in resolve_designs(args, mode):
-            single_run(out, mode, args, name, params)
-        out.out()
-        return
-
-    if mode == RunMode.ANALYZE:
-        stats = [run_mode_analyze(ys, tag_for(d, p), args.flow, detailed_timing=args.detailed_timing)
-                 for ys in args.yosys for d, p in resolve_designs(args, mode)]
-        stats = [s for s in stats if s]
-        assert stats, "no results"
-        for s in stats: out.add_stats(s, args.yosys)
-        out.out()
-        return
-
-    if mode == RunMode.FF:
-        cell_cats = dump_cell_groups(args.yosys[0])
-        results = [run_mode_ff(args.yosys[0], tag_for(d, p), cell_cats=cell_cats, ff_size=args.ff_size)
-                   for d, p in resolve_designs(args, mode)]
-        assert results, "no results"
-        if OutputMode(args.output) == OutputMode.CSV:
-            print("design;seq;comb;other;total;ff_ratio;abc_area;ff_area;total_area;ff_area_pct")
-            for r in results:
-                print(f"{r['design']};{r['seq']};{r['comb']};{r['other']};{r['total']};"
-                      f"{r['ratio']:.4f};{r['abc_area']};{r['ff_area']};{r['total_area']};{r['ff_area_pct']:.2f}")
-        else:
-            print(f"(ff_size={args.ff_size})")
-            for res in results: out.add_ff(res)
+    match mode:
+        case RunMode.ARTIFACT | RunMode.VERILOG | RunMode.SYNTH:
+            run_basic_modes(out, mode, args, design_list)
+        case RunMode.ANALYZE:
+            run_analyze(out, args, design_list)
+        case RunMode.FF:
+            run_ff(out, args, design_list)
 
 
 if __name__ == "__main__":
     main()
+
