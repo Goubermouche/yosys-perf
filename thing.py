@@ -50,7 +50,9 @@ def common_parent(paths):
         if len(set(parts)) > 1:
             break
         common.append(parts[0])
-    return Path(*common) if common else Path(".")
+    if common:
+        return Path(*common)
+    return Path(".")
 
 
 def fmt_params(params):
@@ -61,7 +63,9 @@ def fmt_params(params):
 
 def tag_for(design, params):
     fp = fmt_params(params)
-    return f"{design}_{fp}" if fp else design
+    if fp:
+        return f"{design}_{fp}"
+    return design
 
 
 def artifact_path(tag):
@@ -99,7 +103,12 @@ def load_cell_groups(json_path):
         groups = json.load(f).get("groups", {})
     cats = {}
     for gname, types in groups.items():
-        cat = "seq" if gname in SEQ_GROUPS else "mem" if gname in MEM_GROUPS else "comb"
+        if gname in SEQ_GROUPS:
+            cat = "seq"
+        elif gname in MEM_GROUPS:
+            cat = "mem"
+        else:
+            cat = "comb"
         for t in types:
             cats[t] = cat
     return cats
@@ -147,7 +156,10 @@ def run_yosys(yosys_bin, script, detailed_timing=False):
 def synth_and_abc(yosys_bin, tag, flow="flatten", detailed_timing=False):
     ap = artifact_path(tag)
     assert ap.exists(), f"artifact not found: {ap}"
-    synth_cmd = "synth -flatten -noabc" if flow == "flatten" else "synth -noabc"
+    if flow == "flatten":
+        synth_cmd = "synth -flatten -noabc"
+    else:
+        synth_cmd = "synth -noabc"
     return run_yosys(
         yosys_bin,
         f"read_rtlil {ap}; {synth_cmd}; stat; abc -g {ABC_GATES} -script +print_stats",
@@ -188,7 +200,10 @@ def _parse_stat_old(output):
         r'(?:Printing statistics|Count including submodules).*?\n(.*?)(?=End of script|\Z)',
         output, re.DOTALL | re.IGNORECASE,
     )
-    summary = match.group(1) if match else ""
+    if match:
+        summary = match.group(1)
+    else:
+        summary = ""
     stats = {}
     for field in _STAT_FIELDS + ["cells"]:
         m = re.search(rf'Number of {field}:\s+(\d+)', summary, re.IGNORECASE)
@@ -206,6 +221,7 @@ def _parse_stat_old(output):
 
 
 def parse_stat(output):
+    # new format: "    60224 cells"
     cells_matches = list(re.finditer(r'^\s+(\d+)\s+cells\s*$', output, re.MULTILINE))
     if cells_matches:
         stats = _parse_stat_new(output, cells_matches[-1])
@@ -263,15 +279,28 @@ def format_pass_timing(pass_times, top_n=10):
     if not pass_times:
         return ""
     total = sum(t for _, t, _ in pass_times)
-    show = pass_times if top_n is None else pass_times[:top_n]
+    if top_n is None:
+        show = pass_times
+    else:
+        show = pass_times[:top_n]
     lines = []
     for name, secs, count in show:
-        pct = (secs / total * 100) if total else 0
-        suffix = f" ({count}x)" if count > 1 else ""
+        if total:
+            pct = secs / total * 100
+        else:
+            pct = 0
+        if count > 1:
+            suffix = f" ({count}x)"
+        else:
+            suffix = ""
         lines.append(f"    {pct:5.1f}%  {secs:6.3f}s  {name}{suffix}")
     if top_n and len(pass_times) > top_n:
         rest = total - sum(t for _, t, _ in show)
-        lines.append(f"    {rest / total * 100 if total else 0:5.1f}%  ... {len(pass_times) - top_n} more passes")
+        if total:
+            rest_pct = rest / total * 100
+        else:
+            rest_pct = 0
+        lines.append(f"    {rest_pct:5.1f}%  ... {len(pass_times) - top_n} more passes")
     return '\n'.join(lines)
 
 
@@ -292,7 +321,10 @@ class HumanOut:
     def add_stats(self, stats, yosys_bins):
         design = stats.get("design", "?")
         yosys = Path(stats.get("yosys", "yosys")).name
-        prefix = f"{yosys}: {design}" if len(yosys_bins) > 1 else design
+        if len(yosys_bins) > 1:
+            prefix = f"{yosys}: {design}"
+        else:
+            prefix = design
 
         user = stats.get("user_time")
         if user is not None:
@@ -312,7 +344,10 @@ class HumanOut:
         pass_timing = stats.get("pass_timing")
         top_times = stats.get("top_times")
         if pass_timing:
-            top_n = None if self._verbose else 10
+            if self._verbose:
+                top_n = None
+            else:
+                top_n = 10
             print(f"  Pass timing:\n{format_pass_timing(pass_timing, top_n=top_n)}")
         elif top_times:
             parts = [f"{pct}% {name} ({count}x)" for name, pct, count, _ in top_times]
@@ -394,11 +429,13 @@ class CsvOut:
             print(label)
             header()
             for d in designs:
-                vals = ";".join(
-                    f"{data[(ys, d)]:{fmt}}" if (ys, d) in data else ""
-                    for ys in yosyes
-                )
-                print(f"{d};{vals};")
+                parts = []
+                for ys in yosyes:
+                    if (ys, d) in data:
+                        parts.append(f"{data[(ys, d)]:{fmt}}")
+                    else:
+                        parts.append("")
+                print(f"{d};{';'.join(parts)};")
             print()
 
 
@@ -422,7 +459,11 @@ def run_mode_basic(out, mode, design, synth_mode, yosys, params):
 
     log = r([str(yosys), "-p", script])
     m = yosys_log_end.search(log)
-    out.add(yosys, f"{tag}-{synth_mode.name}", m.group(0) if m else "(no end-of-script marker)")
+    if m:
+        result = m.group(0)
+    else:
+        result = "(no end-of-script marker)"
+    out.add(yosys, f"{tag}-{synth_mode.name}", result)
 
 
 def run_mode_analyze(yosys_bin, tag, flow, detailed_timing=False):
@@ -444,6 +485,14 @@ def run_mode_ff(yosys_bin, tag, cell_cats, ff_size=6):
     abc_area = parse_abc_area(output)
     ff_area = seq * ff_size
     total_area = abc_area + ff_area
+    if total_cells:
+        ratio = seq / total_cells
+    else:
+        ratio = 0.0
+    if total_area:
+        ff_area_pct = ff_area / total_area * 100
+    else:
+        ff_area_pct = 0.0
     return {
         "design": tag,
         "total": total_cells,
@@ -451,11 +500,11 @@ def run_mode_ff(yosys_bin, tag, cell_cats, ff_size=6):
         "mem": totals["mem"],
         "comb": totals["comb"],
         "other": totals["other"],
-        "ratio": seq / total_cells if total_cells else 0.0,
+        "ratio": ratio,
         "abc_area": abc_area,
         "ff_area": ff_area,
         "total_area": total_area,
-        "ff_area_pct": (ff_area / total_area * 100) if total_area else 0.0,
+        "ff_area_pct": ff_area_pct,
         **{f"{c}_types": by_type[c] for c in by_type},
     }
 
@@ -543,7 +592,10 @@ def main():
     args = p.parse_args()
 
     mode = RunMode(args.mode)
-    out = CsvOut() if OutputMode(args.output) == OutputMode.CSV else HumanOut(verbose=args.verbose)
+    if OutputMode(args.output) == OutputMode.CSV:
+        out = CsvOut()
+    else:
+        out = HumanOut(verbose=args.verbose)
     design_list = resolve_designs(args, mode)
 
     match mode:
